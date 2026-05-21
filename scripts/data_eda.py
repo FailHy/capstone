@@ -1,104 +1,120 @@
-# import library data
-import pandas as pd
-import numpy as np
+"""EDA report generator for movement dataset."""
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+
 import matplotlib.pyplot as plt
-from sklearn.preprocessing import LabelEncoder
-import seaborn as sns
+import numpy as np
+import pandas as pd
 
-# load data
-file_path = 'dataset/data_biceps_clean.csv'
+from config import CLEAN_DATASET_PATH, FEATURE_COLUMNS, REPORT_DIR
 
-try:
-    data = pd.read_csv(file_path)
-    print(f'info: dataset loaded successfully, total {len(data)} rows')
-except FileNotFoundError:
-    print(f'ERR: file {file_path} not found')
-    exit()
-    
-# set style seaborn untuk visualisasi
-sns.set_theme(style='whitegrid', palette='muted')
 
-# analyzed features
-features = [
-    'rom_elbow',
-    'upper_arm_angle_std', 
-    'torso_sway_range', 
-    'shoulder_angle_range'
-]
+def save_bar(series: pd.Series, title: str, output: Path, xlabel: str = "", ylabel: str = "count") -> None:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    counts = series.fillna("missing").value_counts()
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.bar(counts.index.astype(str), counts.values)
+    ax.set_title(title)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.tick_params(axis="x", rotation=30)
+    fig.tight_layout()
+    fig.savefig(output, dpi=150)
+    plt.close(fig)
 
-# encode label ke numeric untuk correlation heatmap
-le = LabelEncoder()
-data['label_encoded'] = le.fit_transform(data['label'])
 
-# cek sanity dan target distribusi
-print("\n -- Info dataset --")
-print(data.info())
-print("\n -- Deskripsi --")
-print(data.describe())
+def save_hist_by_label(df: pd.DataFrame, feature: str, output: Path) -> None:
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for label in sorted(df["label"].dropna().unique()):
+        values = pd.to_numeric(df.loc[df["label"] == label, feature], errors="coerce").dropna()
+        ax.hist(values, bins=20, alpha=0.45, label=str(label))
+    ax.set_title(f"Distribution: {feature}")
+    ax.set_xlabel(feature)
+    ax.set_ylabel("count")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(output, dpi=150)
+    plt.close(fig)
 
-# distribusi kelas target
-plt.figure(figsize=(6,4))
-sns.countplot(data=data, x='label', hue='label', palette={'correct': 'blue', 'incorrect': 'red'}, legend=False)   
-plt.title('Distribusi Kelas Target (Correct vs Incorrect)')
-plt.ylabel('Jumlah Repetisi')
-plt.savefig('eda_1_class_distribution.png')
-plt.close()
 
-# boxplot deteksi outlier
-fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-fig.suptitle('Boxplot Distribusi Fitur Berdasarkan Kelas', fontsize=16)
+def save_correlation(df: pd.DataFrame, features, output: Path) -> None:
+    if len(features) < 2:
+        return
+    corr = df[features].corr(numeric_only=True)
+    fig, ax = plt.subplots(figsize=(max(6, len(features) * 0.7), max(5, len(features) * 0.6)))
+    image = ax.imshow(corr, vmin=-1, vmax=1)
+    fig.colorbar(image, ax=ax)
+    ax.set_xticks(np.arange(len(features)))
+    ax.set_yticks(np.arange(len(features)))
+    ax.set_xticklabels(features, rotation=45, ha="right")
+    ax.set_yticklabels(features)
+    ax.set_title("Feature Correlation")
+    for i in range(len(features)):
+        for j in range(len(features)):
+            ax.text(j, i, f"{corr.iloc[i, j]:.2f}", ha="center", va="center", fontsize=8)
+    fig.tight_layout()
+    fig.savefig(output, dpi=150)
+    plt.close(fig)
 
-for i, feature in enumerate(features):
-    row, col = i // 2, i % 2
-    sns.boxplot(data=data, x='label', y=feature, hue='label', ax=axes[row, col], palette={'correct': '#2ecc71', 'incorrect': '#e74c3c'}, legend=False)
-    axes[row, col].set_title(f'Distribusi {feature}')
 
-plt.tight_layout()
-plt.savefig('eda_2_boxplots.png')
-plt.close()
+def run_eda(input_path: Path, output_dir: Path) -> None:
+    if not input_path.exists():
+        raise FileNotFoundError(f"Dataset not found: {input_path}")
 
-# histogram / density plot
-fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-fig.suptitle('Density Plot (Melihat Overlap Antar Kelas)', fontsize=16)
+    df = pd.read_csv(input_path)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-for i, feature in enumerate(features):
-    row, col = i // 2, i % 2
-    # perbaikan: dikembalikan ke kdeplot, bukan boxplot
-    sns.kdeplot(data=data, x=feature, hue='label', fill=True, alpha=0.5, ax=axes[row, col], palette={'correct': '#2ecc71', 'incorrect': '#e74c3c'})
-    axes[row, col].set_title(f'Density {feature}')
+    features = [col for col in FEATURE_COLUMNS if col in df.columns]
+    for col in features:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
 
-plt.tight_layout()
-plt.savefig('eda_3_kdeplots.png')
-plt.close()
+    summary = {
+        "rows": int(len(df)),
+        "columns": list(df.columns),
+        "features_detected": features,
+        "missing_values": {col: int(df[col].isna().sum()) for col in df.columns},
+    }
 
-# scatter plot
-plt.figure(figsize=(8, 6))
-sns.scatterplot(data=data, x='upper_arm_angle_std', y='shoulder_angle_range', hue='label', 
-                palette={'correct': '#2ecc71', 'incorrect': '#e74c3c'}, s=100, alpha=0.7)
-plt.title('Pemisahan Kelas: Upper Arm Std vs Shoulder Range')
-plt.xlabel('Upper Arm Angle Standard Deviation')
-plt.ylabel('Shoulder Angle Range')
+    for col in ["label", "error_type", "subject_id", "session_id", "camera_position", "lighting_condition", "exercise_type"]:
+        if col in df.columns:
+            summary[f"distribution_{col}"] = df[col].fillna("missing").value_counts().to_dict()
+            save_bar(df[col], f"Distribution: {col}", output_dir / f"eda_{col}_distribution.png", xlabel=col)
 
-# tambahkan garis batas keputusan sederhana secara visual (estimasi)
-plt.axvline(x=10, color='gray', linestyle='--', label='Batas Threshold Clean (Std=10)')
-plt.axhline(y=35, color='gray', linestyle=':', label='Batas Threshold Clean (Shoulder=35)')
-plt.legend()
-plt.savefig('eda_4_scatterplot.png')
-plt.close()
+    for feature in features:
+        if "label" in df.columns:
+            save_hist_by_label(df, feature, output_dir / f"eda_{feature}_by_label.png")
 
-# correlation heatmap
-plt.figure(figsize=(8, 6))
+    save_correlation(df, features, output_dir / "eda_feature_correlation.png")
 
-# korelasi antara fitur dan label_encoded
-corr_matrix = data[features + ['label_encoded']].corr()
+    # Feature-label correlation for binary labels only.
+    if "label" in df.columns and set(df["label"].dropna().unique()).issubset({"correct", "incorrect"}):
+        temp = df.copy()
+        temp["label_encoded"] = temp["label"].map({"correct": 0, "incorrect": 1})
+        corr_to_label = temp[features + ["label_encoded"]].corr(numeric_only=True)["label_encoded"].drop("label_encoded")
+        summary["feature_correlation_to_label"] = corr_to_label.sort_values(ascending=False).to_dict()
 
-# perbaikan: hapus 'pd.np' dan gunakan 'np' secara langsung agar tidak error
-# buat mask agar heatmap tidak duplikat (bentuk segitiga)
-mask = np.triu(np.ones_like(corr_matrix, dtype=bool))
+    with (output_dir / "eda_summary.json").open("w") as f:
+        json.dump(summary, f, indent=2)
 
-sns.heatmap(corr_matrix, annot=True, cmap='coolwarm', fmt=".2f", mask=mask, vmin=-1, vmax=1)
-plt.title('Heatmap Korelasi Fitur Biomekanik')
-plt.savefig('eda_5_correlation.png')
-plt.close()
+    print(f"INFO: EDA files saved to {output_dir}")
+    print(json.dumps(summary, indent=2))
 
-print("\nINFO: EDA Selesai! Semua grafik telah disimpan sebagai file PNG di folder saat ini.")
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run EDA on clean movement dataset.")
+    parser.add_argument("--input", type=Path, default=CLEAN_DATASET_PATH)
+    parser.add_argument("--output-dir", type=Path, default=REPORT_DIR)
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    run_eda(args.input, args.output_dir)
+
+
+if __name__ == "__main__":
+    main()

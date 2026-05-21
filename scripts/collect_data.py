@@ -1,287 +1,375 @@
-# script evaluasi biceps curl dengan xgboost
-# scale invariant mode: hanya fokus pada sudut pergerakan (the core four)
+from __future__ import annotations
+
+import argparse
+import csv
+import threading
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, Optional
 
 import cv2
 import mediapipe as mp
 import numpy as np
-import csv
-import os
-import time
-import threading
-import pygame
 
-# inisialisasi pygame mixer untuk play audio
-pygame.mixer.init()
+try:
+    import pygame
+except Exception:  # Bergantung pada audio backend lokal
+    pygame = None
 
-# function untuk play sound beep saat 1 rep selesai
-def play_beep():
-    try:
-        # stop music yang mungkin lagi play
-        pygame.mixer.music.stop()
-        
-        # setup durasi dan frequency beep
-        sample_rate = 44100
-        duration = 0.3
-        frequency = 440
-        t = np.linspace(0, duration, int(sample_rate * duration), False)
-        
-        # generate wave sound
-        wave = np.sin(frequency * 2 * np.pi * t) * 32767
-        wave = wave.astype(np.int16)
-        
-        # bikin stereo sound dan play
-        stereo_wave = np.column_stack((wave, wave))
-        sound = pygame.sndarray.make_sound(stereo_wave)
-        sound.play()
-    except Exception as e:
-        pass
+# Mengimpor variabel konfigurasi dan utilitas dari file proyek lainnya
+from config import (
+    DATASET_COLUMNS,
+    ELBOW_START_ANGLE,
+    RAW_DATASET_PATH,
+    REJECTED_SAMPLE_LOG,
+    VISIBILITY_THRESHOLD,
+)
+from feature_utils import RepBuffer, RepetitionSegmenter, extract_repetition_features, validate_repetition_quality
+from pose_utils import arm_visibility_ok, compute_frame_angles, get_arm_landmarks
 
-# inisialisasi module mediapipe pose
-mp_pose = mp.solutions.pose
-mp_drawing = mp.solutions.drawing_utils
-
-# setup styling untuk drawing skeleton
-draw_spec_landmark = mp_drawing.DrawingSpec(color=(0, 255, 0), thickness=2, circle_radius=3)
-draw_spec_connection = mp_drawing.DrawingSpec(color=(255, 255, 0), thickness=2)
-
-# setup folder dataset dan path file csv
-DATASET_DIR = "dataset"
-CSV_FILE = os.path.join(DATASET_DIR, "data_training_biceps.csv")
-os.makedirs(DATASET_DIR, exist_ok=True)
-
-# define header csv (hanya the core four biomechanical features)
-CSV_HEADER = [
-    "sample_id",
-    "exercise",
-    "active_arm",                
-    "rom_elbow",                 
-    "upper_arm_angle_std",       
-    "torso_sway_range",          
-    "shoulder_angle_range",      
-    "label",
-    "notes"
-]
-
-# create file csv dan tulis header kalau belum exist
-if not os.path.exists(CSV_FILE):
-    with open(CSV_FILE, mode="w", newline="") as file:
-        writer = csv.writer(file)
-        writer.writerow(CSV_HEADER)
-
-EXERCISE_TYPE = "biceps"
-
-# function untuk menghitung angle sendi berdasarkan 3 titik koordinat
-def calculate_angle(a, b, c):
-    a, b, c = np.array(a), np.array(b), np.array(c)
-    radians = np.arctan2(c[1] - b[1], c[0] - b[0]) - np.arctan2(a[1] - b[1], a[0] - b[0])
-    angle = np.abs(radians * 180.0 / np.pi)
-    
-    # pastikan angle tidak lebih dari 180 derajat
-    if angle > 180.0:
-        angle = 360.0 - angle
-    return angle
-
-# function menghitung angle vektor terhadap garis vertical y-axis (gravitasi)
-def angle_with_y_axis(p_top, p_bottom):
-    dx = p_bottom[0] - p_top[0]
-    dy = p_bottom[1] - p_top[1]
-    
-    # convert ke degree angle
-    angle = np.degrees(np.arctan2(abs(dx), abs(dy)))
-    return angle
-
-# deklarasi variabel system
-counter = 0
-stage = "down"  
-active_arm = None 
-sample_id = 1
-prev_time = 0
-rep_start_time = 0
-
-# siapkan array buffer untuk tampung data sudut per frame (koordinat piksel dihapus)
-rep_data = {
-    "elbow_angles": [], "shoulder_angles": [], "upper_arm_angles": [],
-    "torso_angles": [], "visibilities": []
+# -----------------------------------------------------------------------------
+# MAPPING LABEL (Sesuai Validasi Pakar / SME)
+# Format: Tombol: ("Label Biner", "Error Type", "Notes")
+# -----------------------------------------------------------------------------
+LABEL_KEYS = {
+    ord("c"): ("correct", "correct", "good_form"),
+    ord("1"): ("incorrect", "body_swing", "badan_bergerak"),
+    ord("2"): ("incorrect", "elbow_swing", "siku_maju_mundur"),
+    ord("3"): ("incorrect", "not_full_up", "rom_tidak_penuh"),
+    ord("4"): ("incorrect", "too_fast", "tempo_terlalu_cepat"),
+    ord("i"): ("incorrect", "unknown_incorrect", "bad_form_unspecified"),
 }
 
-waiting_label = False
-last_extracted_features = None
-validation_msg = "Ready. Do 1 rep."
+# -----------------------------------------------------------------------------
+# SETUP UI TERMINAL (Interactive Setup)
+# -----------------------------------------------------------------------------
+def get_user_metadata() -> dict:
+    """Meminta input metadata dari user via terminal sebelum kamera terbuka."""
+    print("="*45)
+    print("  BICEPS DATA COLLECTOR - PENGATURAN SESI")
+    print("="*45)
+    
+    # Pilih Subject ID (S01 - S10)
+    while True:
+        try:
+            sub_id = int(input("Pilih Subject ID (1-10) : "))
+            if 1 <= sub_id <= 10:
+                subject_str = f"S{sub_id:02d}" # Format S01, S02, dst.
+                break
+            print("Harap masukkan angka 1 hingga 10.")
+        except ValueError:
+            print("Input tidak valid! Masukkan angka.")
 
-# open webcam
-openCamera = cv2.VideoCapture(0)
+    # Pilih Session ID (1 - 5)
+    while True:
+        try:
+            ses_id = int(input("Pilih Session ID (1-5)  : "))
+            if 1 <= ses_id <= 5:
+                session_str = f"session_{ses_id:02d}" # Format session_01, dst.
+                break
+            print("Harap masukkan angka 1 hingga 5.")
+        except ValueError:
+            print("Input tidak valid! Masukkan angka.")
 
-# running mediapipe pose
-with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
-    while openCamera.isOpened():
-        success, frame = openCamera.read()
-        if not success: break
+    # Pengaturan Default yang aman
+    camera_pos = "side"
+    lighting = "normal"
+    exercise = "biceps"
 
-        # mirror frame supaya natural view
-        frame = cv2.flip(frame, 1)
-        height, width, _ = frame.shape
-        
-        # kalkulasi fps
-        current_time = time.time()
-        fps = 1 / (current_time - prev_time) if prev_time > 0 else 0
-        prev_time = current_time
+    print("\n--- KONFIRMASI SESI ---")
+    print(f"Subject : {subject_str}")
+    print(f"Session : {session_str}")
+    print("Menyiapkan kamera...\n")
+    
+    return {
+        "subject_id": subject_str,
+        "session_id": session_str,
+        "camera_position": camera_pos,
+        "lighting_condition": lighting,
+        "exercise_type": exercise,
+    }
 
-        # convert frame color untuk diproses mediapipe
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = pose.process(frame_rgb)
 
-        if results.pose_landmarks:
-            landmarks = results.pose_landmarks.landmark
+# -----------------------------------------------------------------------------
+# FUNGSI UTILITAS SISTEM
+# -----------------------------------------------------------------------------
+def init_audio() -> None:
+    """Inisialisasi sistem audio untuk feedback suara."""
+    if pygame is None:
+        return
+    try:
+        pygame.mixer.init()
+    except Exception:
+        pass
+
+def play_beep() -> None:
+    """Memutar suara 'beep' pendek saat satu repetisi selesai dideteksi."""
+    if pygame is None:
+        return
+    try:
+        pygame.mixer.music.stop()
+        sample_rate = 44100
+        duration = 0.25
+        frequency = 660 # Nada menengah yang nyaman
+        t = np.linspace(0, duration, int(sample_rate * duration), False)
+        wave = (np.sin(frequency * 2 * np.pi * t) * 32767).astype(np.int16)
+        stereo_wave = np.column_stack((wave, wave))
+        pygame.sndarray.make_sound(stereo_wave).play()
+    except Exception:
+        pass
+
+def ensure_csv(path: Path) -> None:
+    """Memastikan file CSV tujuan sudah ada dan memiliki header yang benar."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        with path.open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=DATASET_COLUMNS)
+            writer.writeheader()
+
+def next_sample_id(path: Path) -> int:
+    """Mencari ID sampel terakhir di dataset agar tidak menimpa data lama."""
+    if not path.exists(): 
+        return 1
+    try:
+        import pandas as pd
+        df = pd.read_csv(path)
+        if "sample_id" not in df.columns or df.empty: 
+            return 1
+        return int(df["sample_id"].max()) + 1
+    except Exception: 
+        return 1
+
+def append_row(path: Path, row: Dict[str, object]) -> None:
+    """Menambahkan baris data fitur baru ke dalam dataset CSV."""
+    ensure_csv(path)
+    with path.open("a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=DATASET_COLUMNS, extrasaction="ignore")
+        writer.writerow(row)
+
+def log_rejection(reason: str, row_data: Optional[dict] = None) -> None:
+    """Mencatat repetisi yang dibuang atau dilewati (skip) ke file log khusus."""
+    print(f"[REJECTED] {reason}")
+    if row_data is None:
+        return
+    REJECTED_SAMPLE_LOG.parent.mkdir(parents=True, exist_ok=True)
+    exists = REJECTED_SAMPLE_LOG.exists()
+    with REJECTED_SAMPLE_LOG.open("a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(row_data.keys()) + ["reject_reason"], extrasaction="ignore")
+        if not exists:
+            writer.writeheader()
+        row_data["reject_reason"] = reason
+        writer.writerow(row_data)
+
+def choose_active_arm(left_angle: Optional[float], right_angle: Optional[float]) -> Optional[str]:
+    """Menentukan lengan mana yang sedang mengangkat beban (kiri/kanan) berdasarkan sudut."""
+    candidates = []
+    if left_angle is not None and left_angle < ELBOW_START_ANGLE:
+        candidates.append((left_angle, "left"))
+    if right_angle is not None and right_angle < ELBOW_START_ANGLE:
+        candidates.append((right_angle, "right"))
+    if not candidates: 
+        return None
+    # Pilih lengan yang ditekuk paling tajam
+    return min(candidates, key=lambda item: item[0])[1]
+
+def put_text(frame, text: str, y: int, color=(255, 255, 255)) -> None:
+    """Helper untuk menulis teks di atas frame video dengan cepat."""
+    cv2.putText(frame, text, (15, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
+
+
+# -----------------------------------------------------------------------------
+# PROGRAM UTAMA (MAIN LOOP)
+# -----------------------------------------------------------------------------
+def main() -> None:
+    # Set output dataset sesuai konfigurasi
+    output_path = RAW_DATASET_PATH
+    camera_index = 0
+    is_mirrored = True
+
+    # 1. Panggil form setup di terminal sebelum membuka OpenCV
+    metadata_base = get_user_metadata()
+
+    # 2. Setup sistem (Audio & File)
+    init_audio()
+    ensure_csv(output_path)
+    sample_id = next_sample_id(output_path)
+
+    # 3. Setup MediaPipe
+    mp_pose = mp.solutions.pose
+    mp_drawing = mp.solutions.drawing_utils
+    draw_spec = mp_drawing.DrawingSpec(color=(0, 255, 0), thickness=2, circle_radius=3)
+
+    # 4. Buka Kamera
+    cap = cv2.VideoCapture(camera_index)
+    if not cap.isOpened():
+        print(f"ERROR: Tidak bisa membuka kamera (Index {camera_index}).")
+        return
+
+    # Inisialisasi variabel state/buffer
+    segmenter = RepetitionSegmenter()
+    buffer = RepBuffer()
+    active_arm = None
+    waiting_label = False
+    pending_row = None
+    counter = 0
+    
+    # Variabel Interaktif
+    is_recording = False 
+    status = "TEKAN SPASI UNTUK MULAI MEREKAM LATIHAN"
+    prev_time = time.time()
+    help_text = "Key: c=Correct, 1=BodySwing, 2=ElbowSwing, 3=NotFullUp, 4=TooFast, SPACE=Start"
+
+    # Jalankan engine MediaPipe Pose
+    with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
+        while cap.isOpened():
+            ok, frame = cap.read()
+            if not ok: 
+                break
+
+            if is_mirrored: 
+                frame = cv2.flip(frame, 1)
+            height, width = frame.shape[:2]
             
-            # ekstrak tangan kanan (kita pakai landmark LEFT dari mediapipe efek dari cv2.flip)
-            r_shoulder = [landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value].x, landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value].y]
-            r_elbow = [landmarks[mp_pose.PoseLandmark.LEFT_ELBOW.value].x, landmarks[mp_pose.PoseLandmark.LEFT_ELBOW.value].y]
-            r_wrist = [landmarks[mp_pose.PoseLandmark.LEFT_WRIST.value].x, landmarks[mp_pose.PoseLandmark.LEFT_WRIST.value].y]
-            r_hip = [landmarks[mp_pose.PoseLandmark.LEFT_HIP.value].x, landmarks[mp_pose.PoseLandmark.LEFT_HIP.value].y]
-            r_vis = (landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value].visibility + landmarks[mp_pose.PoseLandmark.LEFT_ELBOW.value].visibility) / 2.0
-            r_elbow_angle = calculate_angle(r_shoulder, r_elbow, r_wrist)
+            # Hitung FPS
+            now = time.time()
+            fps = 1.0 / max(now - prev_time, 1e-6)
+            prev_time = now
 
-            # ekstrak tangan kiri (kita pakai landmark RIGHT dari mediapipe efek dari cv2.flip)
-            l_shoulder = [landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].x, landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].y]
-            l_elbow = [landmarks[mp_pose.PoseLandmark.RIGHT_ELBOW.value].x, landmarks[mp_pose.PoseLandmark.RIGHT_ELBOW.value].y]
-            l_wrist = [landmarks[mp_pose.PoseLandmark.RIGHT_WRIST.value].x, landmarks[mp_pose.PoseLandmark.RIGHT_WRIST.value].y]
-            l_hip = [landmarks[mp_pose.PoseLandmark.RIGHT_HIP.value].x, landmarks[mp_pose.PoseLandmark.RIGHT_HIP.value].y]
-            l_vis = (landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].visibility + landmarks[mp_pose.PoseLandmark.RIGHT_ELBOW.value].visibility) / 2.0
-            l_elbow_angle = calculate_angle(l_shoulder, l_elbow, l_wrist)
+            # Proses Pose
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            results = pose.process(frame_rgb)
+            left_angle = right_angle = None
 
-            # cek active arm dan start rep
-            if stage == "down" and not waiting_label:
-                # jika siku kiri mulai naik duluan
-                if l_elbow_angle < 130:
-                    active_arm = "left"
-                    stage = "up"
-                    rep_start_time = time.time()
-                    validation_msg = "Recording LEFT Arm..."
-                # jika siku kanan mulai naik duluan
-                elif r_elbow_angle < 130:
-                    active_arm = "right"
-                    stage = "up"
-                    rep_start_time = time.time()
-                    validation_msg = "Recording RIGHT Arm..."
+            # Jika tubuh terdeteksi dan tidak sedang menunggu label dari user
+            if results.pose_landmarks and not waiting_label:
+                landmarks = results.pose_landmarks.landmark
+                try:
+                    left_lm = get_arm_landmarks(landmarks, mp_pose, "left", is_mirrored)
+                    right_lm = get_arm_landmarks(landmarks, mp_pose, "right", is_mirrored)
 
-            # proses rekam data hanya untuk lengan yang active
-            if stage == "up" and not waiting_label:
-                # set koordinat target berdasarkan active arm
-                if active_arm == "left":
-                    cur_shoulder, cur_elbow, cur_wrist, cur_hip, cur_vis = l_shoulder, l_elbow, l_wrist, l_hip, l_vis
-                    cur_elbow_angle = l_elbow_angle
-                else:
-                    cur_shoulder, cur_elbow, cur_wrist, cur_hip, cur_vis = r_shoulder, r_elbow, r_wrist, r_hip, r_vis
-                    cur_elbow_angle = r_elbow_angle
+                    if arm_visibility_ok(left_lm): 
+                        left_angle = compute_frame_angles(left_lm)["elbow_angle"]
+                    if arm_visibility_ok(right_lm): 
+                        right_angle = compute_frame_angles(right_lm)["elbow_angle"]
 
-                # hitung angle features untuk machine learning
-                shoulder_angle = calculate_angle(cur_hip, cur_shoulder, cur_elbow)
-                upper_arm_angle = angle_with_y_axis(cur_shoulder, cur_elbow)
-                torso_angle = angle_with_y_axis(cur_shoulder, cur_hip)
+                    # -------------------------------------------------------------
+                    # LOGIKA EKSTRAKSI (HANYA BERJALAN JIKA USER SUDAH TEKAN SPASI)
+                    # -------------------------------------------------------------
+                    if is_recording:
+                        # Tentukan lengan mana yang bekerja saat pertama kali bergerak
+                        if active_arm is None:
+                            selected = choose_active_arm(left_angle, right_angle)
+                            if selected is not None:
+                                active_arm = selected
+                                buffer.clear()
+                                segmenter.reset(keep_down=True)
+                                status = f"Merekam Lengan {active_arm.upper()}..."
 
-                # append hasil hitungan ke dictionary buffer murni sudut saja
-                rep_data["elbow_angles"].append(cur_elbow_angle)
-                rep_data["shoulder_angles"].append(shoulder_angle)
-                rep_data["upper_arm_angles"].append(upper_arm_angle)
-                rep_data["torso_angles"].append(torso_angle)
-                rep_data["visibilities"].append(cur_vis)
+                        # Evaluasi per frame dari lengan yang bekerja
+                        if active_arm is not None:
+                            arm_lm = get_arm_landmarks(landmarks, mp_pose, active_arm, is_mirrored)
+                            if arm_visibility_ok(arm_lm, VISIBILITY_THRESHOLD):
+                                frame_features = compute_frame_angles(arm_lm)
+                                event = segmenter.update(frame_features["elbow_angle"], now)
 
-                # trigger untuk end rep (gerakan balik ke posisi lurus)
-                if cur_elbow_angle > 140:
-                    stage = "down"
-                    
-                    # durasi waktu tidak lagi disimpan ke csv, murni jadi gatekeeper internal
-                    rep_duration_internal = time.time() - rep_start_time
-                    
-                    # ekstrak data buat validasi dan features
-                    rom_elbow = max(rep_data["elbow_angles"]) - min(rep_data["elbow_angles"])
-                    avg_vis = sum(rep_data["visibilities"]) / len(rep_data["visibilities"])
-                    
-                    # gatekeeper rules buat filter data jelek
-                    is_valid = True
-                    if rom_elbow < 60:
-                        validation_msg = f"DROP: ROM < 60 ({active_arm.upper()})"
-                        is_valid = False
-                    elif rep_duration_internal < 0.6:
-                        validation_msg = "DROP: Terlalu Cepat (< 0.6s)"
-                        is_valid = False
-                    elif avg_vis < 0.6:
-                        validation_msg = "DROP: Visibilitas rendah"
-                        is_valid = False
+                                # Masukkan sudut ke buffer selama fase pergerakan
+                                if event in {"started", "moving_up", "top", "up", "moving_down", "completed", "completed_partial", "down"}:
+                                    buffer.append(now, frame_features)
 
-                    # kalau data tembus gatekeeper, lanjut siapkan fitur core four
-                    if is_valid:
-                        counter += 1
-                        # running beep pake thread biar frame nggak nge-freeze
-                        threading.Thread(target=play_beep, daemon=True).start()
-                        validation_msg = f"Valid ({active_arm.upper()})! C=Correct, I=Incorrect, S=Skip"
-                        
-                        # kumpulkan fitur ke dalam array untuk ditulis ke csv nanti
-                        last_extracted_features = [
-                            sample_id,
-                            EXERCISE_TYPE,
-                            active_arm, 
-                            round(rom_elbow, 2),
-                            round(np.std(rep_data["upper_arm_angles"]), 2),
-                            round(max(rep_data["torso_angles"]) - min(rep_data["torso_angles"]), 2),
-                            round(max(rep_data["shoulder_angles"]) - min(rep_data["shoulder_angles"]), 2)
-                        ]
-                        # hold system buat minta input label user
-                        waiting_label = True
-                    
-                    # bersihkan array buffer buat rep selanjutnya
-                    for key in rep_data:
-                        rep_data[key].clear()
+                                # Jika 1 repetisi penuh selesai
+                                if event in {"completed", "completed_partial"}:
+                                    features = extract_repetition_features(buffer)
+                                    is_valid, reason = validate_repetition_quality(buffer, features)
+                                    
+                                    # Jika data rep tidak absurd, siapkan untuk diberi label
+                                    if is_valid:
+                                        pending_row = {
+                                            "sample_id": sample_id, 
+                                            "timestamp": datetime.utcnow().isoformat(timespec="seconds"), 
+                                            **metadata_base, 
+                                            "active_arm": active_arm, 
+                                            **features
+                                        }
+                                        waiting_label = True
+                                        counter += 1
+                                        status = "Repetisi Selesai! Beri Label Sekarang (c/1/2/3/4)"
+                                        threading.Thread(target=play_beep, daemon=True).start()
+                                    else:
+                                        status = f"Repetisi Ditolak: {reason}"
+                                    
+                                    # Bersihkan memori untuk repetisi berikutnya
+                                    buffer.clear()
+                                    segmenter.reset(keep_down=True)
+                                    active_arm = None
+                except Exception as exc:
+                    status = f"Pose error: {exc}"
 
-            # render text angle di area siku
-            l_pixel = tuple(np.multiply(l_elbow, [width, height]).astype(int))
-            r_pixel = tuple(np.multiply(r_elbow, [width, height]).astype(int))
-            cv2.putText(frame, f"L:{int(l_elbow_angle)}", l_pixel, cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
-            cv2.putText(frame, f"R:{int(r_elbow_angle)}", r_pixel, cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+                # Gambar rangka/skeleton di layar
+                mp_drawing.draw_landmarks(frame, results.pose_landmarks, mp_pose.POSE_CONNECTIONS, draw_spec, draw_spec)
+
+            # -------------------------------------------------------------
+            # LOGIKA INPUT KEYBOARD OLEH USER
+            # -------------------------------------------------------------
+            key = cv2.waitKey(1) & 0xFF
             
-            # draw skeleton connections
-            mp_drawing.draw_landmarks(frame, results.pose_landmarks, mp_pose.POSE_CONNECTIONS, draw_spec_landmark, draw_spec_connection)
-
-        # render ui informasi text di pojok kiri atas
-        cv2.putText(frame, f"Reps: {counter} | Stage: {stage} | Arm: {active_arm}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
-        cv2.putText(frame, f"Status: {validation_msg}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0) if "Valid" in validation_msg else (0, 0, 255), 2)
-
-        # baca input keyboard buat interact system
-        key = cv2.waitKey(1) & 0xFF
-        
-        # logic kalau lagi mode input label manual
-        if waiting_label and last_extracted_features is not None:
-            label, notes = None, None
-            if key == ord("c"):
-                label, notes = "correct", "good form"
-            elif key == ord("i"):
-                label, notes = "incorrect", "bad form"
-            elif key == ord("s"):
-                print("[SKIPPED] Data dibuang.")
-                waiting_label = False
-                validation_msg = "Skipped. Do next rep."
-
-            # save ke csv kalau user udah tekan tombol label
-            if label:
-                row_data = last_extracted_features + [label, notes]
-                with open(CSV_FILE, mode="a", newline="") as file:
-                    writer = csv.writer(file)
-                    writer.writerow(row_data)
+            # Tekan Spasi untuk mulai merekam
+            if key == ord(' ') and not is_recording and not waiting_label:
+                is_recording = True
+                status = "Mulai! Silakan lakukan repetisi."
                 
-                print(f"\n[SAVED] ID: {sample_id} | Lengan: {active_arm} | Label: {label}")
+            # Saat repetisi selesai dan menunggu tombol label ditekan
+            elif waiting_label and pending_row is not None:
+                if key in LABEL_KEYS:
+                    label, error_type, notes = LABEL_KEYS[key]
+                    pending_row.update({"label": label, "error_type": error_type, "notes": notes})
+                    append_row(output_path, pending_row)
+                    
+                    print(f"TERSIPAN: ID={sample_id} | Label={label.upper()} | Error={error_type}")
+                    
+                    sample_id += 1
+                    pending_row = None
+                    waiting_label = False
+                    status = "Tersimpan. Silakan lakukan repetisi berikutnya."
                 
-                # increment ID dan update UI text
-                sample_id += 1
-                waiting_label = False
-                validation_msg = "Saved! Do next rep."
+                # Tekan 's' untuk skip / membuang data (jika terdeteksi salah secara sistematis)
+                elif key == ord("s"):
+                    log_rejection("manual_skip", pending_row)
+                    pending_row = None
+                    waiting_label = False
+                    status = "Dilewati (Skipped). Silakan lakukan repetisi berikutnya."
 
-        # quit app
-        if key == ord("q"):
-            break
+            # Tekan 'q' untuk keluar dari aplikasi
+            if key == ord("q"): 
+                break
 
-        # tampilin preview frame
-        cv2.imshow("Biceps CV Evaluator", frame)
+            # -------------------------------------------------------------
+            # UI OVERLAY (TAMPILAN TEKS DI ATAS KAMERA)
+            # -------------------------------------------------------------
+            cv2.rectangle(frame, (0, 0), (width, 130), (0, 0, 0), -1)
+            
+            # Beri warna highlight (kuning jika idle, hijau jika merekam, putih default)
+            status_color = (0, 255, 255) if not is_recording else (0, 255, 0) if "Selesai" in status or "Tersimpan" in status else (255, 255, 255)
+            
+            # Baris 1: Info Sistem
+            put_text(frame, f"Sesi: {metadata_base['subject_id']} | ID Berikutnya: {sample_id} | FPS: {fps:.1f}", 25)
+            # Baris 2: Status Repetisi
+            put_text(frame, f"State: {segmenter.state} | Arm: {active_arm}", 55)
+            # Baris 3: Status Interaktif (Sangat Jelas)
+            put_text(frame, f"Status: {status}", 85, status_color)
+            # Baris 4: Instruksi Label (Disederhanakan)
+            put_text(frame, help_text, 115, (255, 200, 0))
 
-# release resource kalau script udah kelar
-openCamera.release()
-cv2.destroyAllWindows()
+            # Tampilkan sudut siku secara live di bagian bawah
+            if left_angle is not None:
+                put_text(frame, f"Left Elbow: {left_angle:.1f}", height - 40)
+            if right_angle is not None:
+                put_text(frame, f"Right Elbow: {right_angle:.1f}", height - 15)
+
+            cv2.imshow("Gerakan Collector - Berbasis Ahli", frame)
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()
