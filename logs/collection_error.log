@@ -1,0 +1,41 @@
+2026-05-21 12:18:47 - ERROR - Error saat memproses landmarks/fitur: 'avg_visibility'
+Traceback (most recent call last):
+  File "/home/paillhy/Kuliah/Semester 6/Project/myproject/scripts/collect_data.py", line 317, in main
+    features = extract_repetition_features(buffer)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/paillhy/Kuliah/Semester 6/Project/myproject/scripts/feature_utils.py", line 131, in extract_repetition_features
+    visibilities = [f["avg_visibility"] for f in features]
+                    ~^^^^^^^^^^^^^^^^^^
+KeyError: 'avg_visibility'
+
+2026-05-21 12:24:06 - ERROR - Pose error: 'avg_visibility'
+2026-05-21 12:24:09 - ERROR - Pose error: 'avg_visibility'
+2026-05-21 12:24:13 - ERROR - Pose error: 'avg_visibility'
+2026-05-21 12:24:55 - ERROR - Pose error: 'avg_visibility'
+2026-05-21 12:24:58 - ERROR - Pose error: 'avg_visibility'
+2026-05-21 12:25:00 - ERROR - Pose error: 'avg_visibility'
+2026-05-21 12:27:35 - ERROR - Pose error: 'avg_visibility'
+2026-05-21 12:27:37 - ERROR - Pose error: 'avg_visibility'
+2026-05-21 12:27:40 - ERROR - Pose error: 'avg_visibility'
+2026-05-21 12:30:19 - ERROR - Pose error: 'avg_visibility'
+2026-05-21 12:30:21 - ERROR - Pose error: 'avg_visibility'
+2026-05-21 12:30:23 - ERROR - Pose error: 'avg_visibility'
+2026-05-21 12:30:24 - ERROR - Pose error: 'avg_visibility'
+2026-05-21 12:32:01 - ERROR - Pose error: 'avg_visibility'
+2026-05-21 12:32:03 - ERROR - Pose error: 'avg_visibility'
+2026-05-21 12:32:03 - ERROR - Pose error: 'avg_visibility'
+2026-05-21 12:32:05 - ERROR - Pose error: 'avg_visibility'
+2026-05-21 12:32:06 - ERROR - Pose error: 'avg_visibility'
+2026-05-21 12:32:08 - ERROR - Pose error: 'avg_visibility'
+2026-05-21 12:32:09 - ERROR - Pose error: 'avg_visibility'
+2026-05-21 12:32:10 - ERROR - Pose error: 'avg_visibility'
+2026-05-21 12:39:14 - ERROR - Pose error: 'avg_visibility'
+2026-05-21 12:39:17 - ERROR - Pose error: 'avg_visibility'
+2026-05-21 12:39:20 - ERROR - Pose error: 'avg_visibility'
+2026-05-21 12:39:23 - ERROR - Pose error: 'avg_visibility'
+2026-05-21 12:39:27 - ERROR - Pose error: 'avg_visibility'
+2026-05-21 12:39:28 - ERROR - Pose error: 'avg_visibility'
+2026-05-21 12:39:32 - ERROR - Pose error: 'avg_visibility'
+2026-05-21 12:40:22 - ERROR - Pose error: 'avg_visibility'
+2026-05-21 12:40:28 - ERROR - Pose error: 'avg_visibility'
+2026-05-21 12:40:30 - ERROR - Pose error: 'avg_visibility'
