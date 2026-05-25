@@ -27,7 +27,7 @@ TRICEPS_MODEL_PKL_PATH = MODEL_DIR / "triceps_xgboost_model.pkl"
 TRICEPS_MODEL_JSON_PATH = MODEL_DIR / "xgboost_triceps_model.json"
 
 # Shared Artifacts
-FEATURE_COLUMNS_PATH = MODEL_DIR / "feature_columns.json"
+FEATURE_COLUMNS_PATH = MODEL_DIR / "feature_columns_biceps.json"
 LABEL_ENCODER_PATH = MODEL_DIR / "label_encoder.pkl"
 MODEL_VERSION_PATH = MODEL_DIR / "model_version.txt"
 TRAINING_METRICS_PATH = MODEL_DIR / "training_metrics.json"
@@ -44,6 +44,7 @@ LEARNING_CURVE_PATH = REPORT_DIR / "xgboost_learning_curve.png"
 # EXERCISE BIOMECHANICS CONFIGURATION (HYBRID GATEKEEPER)
 # =============================================================================
 VISIBILITY_THRESHOLD = 0.5  # Minimum MediaPipe landmark visibility
+CONFIDENCE_THRESHOLD = 0.7 # Minimum Confidence score for ML Models
 
 # EXERCISE_CONFIG dict to handle multiple exercises dynamically
 EXERCISE_CONFIG = {

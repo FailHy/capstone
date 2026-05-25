@@ -59,13 +59,13 @@ def load_and_filter_dataset(path: Path, exercise_type: str) -> pd.DataFrame:
         print("WARNING: Kolom 'exercise_type' tidak ditemukan. Mengasumsikan semua data adalah Biceps.")
         df["exercise_type"] = "biceps"
         
-    # --- PERBAIKAN KRUSIAL: FILTER DATA LEGACY (S00_Legacy) ---
-    if "subject_id" in df.columns:
-        legacy_count = len(df[df["subject_id"] == "S00_Legacy"])
-        if legacy_count > 0:
-            df = df[df["subject_id"] != "S00_Legacy"]
-            print(f"   -> Mengabaikan {legacy_count} baris data 'S00_Legacy'. Murni menggunakan data organik.")
-    # ----------------------------------------------------------
+    # # --- PERBAIKAN KRUSIAL: FILTER DATA LEGACY (S00_Legacy) ---
+    # if "subject_id" in df.columns:
+    #     legacy_count = len(df[df["subject_id"] == "S00_Legacy"])
+    #     if legacy_count > 0:
+    #         df = df[df["subject_id"] != "S00_Legacy"]
+    #         print(f"   -> Mengabaikan {legacy_count} baris data 'S00_Legacy'. Murni menggunakan data organik.")
+    # # ----------------------------------------------------------
 
     df_filtered = df[df["exercise_type"] == exercise_type].copy()
     return df_filtered
@@ -127,7 +127,7 @@ def save_confusion_matrix(y_true, y_pred, label_names, exercise_name: str, outpu
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / f"xgboost_confusion_matrix_{exercise_name}.png"
     
-    cm = confusion_matrix(y_true, y_pred)
+    cm = confusion_matrix(y_true, y_pred, labels=range(len(label_names)))
     plt.figure(figsize=(8, 6))
     sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
                 xticklabels=label_names, yticklabels=label_names)
@@ -181,7 +181,8 @@ def train_single_model(df_filtered: pd.DataFrame, exercise_name: str, args: argp
     print("\n   📊 LAPORAN EVALUASI (TESTING DATA)")
     print(f"   - Akurasi (Accuracy) : {acc:.2f}%")
     print(f"   - Akurasi (Balanced) : {bal_acc:.2f}%\n")
-    print(classification_report(y_test, y_pred, target_names=label_names, zero_division=0))
+    all_labels = list(range(num_classes))
+    print(classification_report(y_test, y_pred, labels=all_labels, target_names=label_names, zero_division=0))
 
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
     
